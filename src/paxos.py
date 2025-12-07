@@ -11,12 +11,10 @@ class Ballot:
     """
     Ballot number for Paxos.
 
-    We order by:
+    Ordered by:
       depth (block index),
       then seq (per-node sequence),
       then proc_id (tie-breaker).
-
-    This matches the spec's "compare depth first, then seq_num, then proc_id".
     """
     depth: int
     seq: int
@@ -65,12 +63,28 @@ class AcceptorState:
             "accepted_value": self.accepted_value,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AcceptorState":
+        promised = data.get("promised")
+        accepted_ballot = data.get("accepted_ballot")
+        accepted_value = data.get("accepted_value")
+
+        return cls(
+            promised=Ballot.from_dict(promised) if promised else None,
+            accepted_ballot=(
+                Ballot.from_dict(accepted_ballot)
+                if accepted_ballot
+                else None
+            ),
+            accepted_value=accepted_value,
+        )
+
 
 class PaxosState:
     """
     Holds acceptor state for all depths in this node.
 
-    Proposer logic will live in the Node layer (using this state),
+    Proposer logic lives in the Node layer (using this state),
     not inside this class.
     """
 
@@ -100,20 +114,13 @@ class PaxosState:
 
         Returns:
             (ok, accepted_ballot, accepted_value)
-
-        If ok == True:
-          - We have promised not to accept ballots < 'ballot'
-          - We return any previously accepted (accepted_ballot, accepted_value).
-
-        If ok == False:
-          - We reject; caller may optionally send a REJECT or ignore.
         """
         acc = self._get_acceptor(depth)
         if acc.promised is None or ballot >= acc.promised:
             acc.promised = ballot
             return True, acc.accepted_ballot, acc.accepted_value
 
-        # Reject: promised ballot is higher than the incoming ballot
+        # Reject
         return False, acc.accepted_ballot, acc.accepted_value
 
     def on_accept(
@@ -135,6 +142,37 @@ class PaxosState:
 
         # Reject
         return False
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Serialize Paxos acceptor state as a dict:
+
+        {
+          "depths": {
+             "1": { acceptor_state_dict },
+             "2": { ... },
+             ...
+          }
+        }
+        """
+        depths: Dict[str, Any] = {}
+        for depth, acc in self._acceptors.items():
+            depths[str(depth)] = acc.to_dict()
+        return {"depths": depths}
+
+    def load_from_dict(self, data: Dict[str, Any]) -> None:
+        """
+        Load Paxos acceptor state from dict produced by to_dict().
+        """
+        self._acceptors.clear()
+        depths = data.get("depths", {})
+        for depth_str, acc_dict in depths.items():
+            depth = int(depth_str)
+            self._acceptors[depth] = AcceptorState.from_dict(acc_dict)
 
     # ------------------------------------------------------------------
     # Debug helpers

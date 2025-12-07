@@ -4,8 +4,7 @@ import json
 import socket
 import threading
 import time
-from typing import Any, Callable, Dict, Tuple
-
+from typing import Any, Callable, Dict, Tuple, Optional
 
 Message = Dict[str, Any]
 OnMessageCallback = Callable[[Message, Tuple[str, int]], None]
@@ -18,7 +17,7 @@ class Network:
     - Each node listens on its (host, port)
     - Messages are JSON {"from": int, "type": str, "payload": {...}}
     - One message per connection (for simplicity)
-    - Optional artificial delay before sending (for later experiments)
+    - 'delay' introduces a constant delay before sending (in seconds)
     """
 
     def __init__(
@@ -28,7 +27,7 @@ class Network:
         port: int,
         nodes_config: Dict[str, Dict[str, Any]],
         on_message: OnMessageCallback,
-        delay: float = 0.0,
+        delay: float = 3.0,  # <-- default 3-second delay per spec
     ):
         self.node_id = node_id
         self.host = host
@@ -37,9 +36,9 @@ class Network:
         self.on_message = on_message
         self.delay = delay
 
-        self.running = False
-        self._server_thread: threading.Thread | None = None
-        self._server_sock: socket.socket | None = None
+        self.running: bool = False
+        self._server_thread: Optional[threading.Thread] = None
+        self._server_sock: Optional[socket.socket] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -75,6 +74,7 @@ class Network:
         host = target_info["host"]
         port = target_info["port"]
 
+        # Constant artificial delay
         if self.delay > 0:
             time.sleep(self.delay)
 

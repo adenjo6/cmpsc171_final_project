@@ -13,6 +13,7 @@ from blockchain import Blockchain
 from block import Block, Transaction
 from network import Network
 from paxos import PaxosState, Ballot
+import persistence
 
 
 @dataclass
@@ -31,11 +32,6 @@ class Node:
     - network (TCP, JSON messages)
     - message queue (for PROMISE/ACCEPTED/etc.)
     - Paxos state (acceptor, and proposer helper logic here)
-
-    For now we assume:
-    - single leader per proposal (the node initiating moneyTransfer),
-    - no failures,
-    - nodes have the same initial state.
     """
 
     def __init__(self, config: NodeConfig):
@@ -47,12 +43,7 @@ class Node:
 
         self.node_id = config.node_id
         self.num_nodes = config.num_nodes
-
-        # Local blockchain + accounts
-        self.blockchain = Blockchain(
-            num_nodes=config.num_nodes,
-            initial_balance=config.initial_balance,
-        )
+        self.initial_balance = config.initial_balance
 
         self.running = True
 
@@ -65,14 +56,23 @@ class Node:
         # Proposer sequence number (for ballots)
         self._seq_counter: int = 0
 
-        # Load cluster config and start network
+        # Load cluster config
         self.nodes_config = self._load_nodes_config()
+
+        # Load or initialize blockchain + Paxos from disk *before* network starts
+        self.blockchain = persistence.load_blockchain(
+            self.node_id, self.num_nodes, self.initial_balance
+        )
+        persistence.load_paxos_state(self.node_id, self.paxos)
+
+        # Start network listener
         self.network = self._init_network()
 
         print(
             f"[Node {self.node_id}] Initialized with "
             f"{self.num_nodes} total nodes, initial balance "
-            f"{config.initial_balance} each."
+            f"{self.initial_balance} each. "
+            f"Current depth={self.blockchain.get_depth() - 1}"
         )
 
     # ------------------------------------------------------------------
@@ -80,9 +80,6 @@ class Node:
     # ------------------------------------------------------------------
 
     def _load_nodes_config(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Load config/nodes.json relative to project root.
-        """
         this_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(this_dir, "..", "config", "nodes.json")
         config_path = os.path.normpath(config_path)
@@ -90,13 +87,16 @@ class Node:
         with open(config_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _init_network(self) -> Network:
+    def _nodes_entry_for_self(self) -> Dict[str, Any]:
         node_entry = self.nodes_config.get(str(self.node_id))
         if not node_entry:
             raise ValueError(
                 f"No entry for node_id={self.node_id} in nodes.json"
             )
+        return node_entry
 
+    def _init_network(self) -> Network:
+        node_entry = self._nodes_entry_for_self()
         host = node_entry["host"]
         port = node_entry["port"]
 
@@ -106,7 +106,7 @@ class Node:
             port=port,
             nodes_config=self.nodes_config,
             on_message=self._on_network_message,
-            delay=0.0,  # can set to 3.0 later to simulate network delay
+            delay=3.0,  # 3-second send delay per spec; tweak to 0.0 while debugging if needed
         )
         net.start()
         return net
@@ -141,7 +141,18 @@ class Node:
             self._handle_paxos_decision(message, addr)
             return
 
-        # These are primarily for proposers to consume
+        if mtype == "SYNC_REQUEST":
+            self._handle_sync_request(message, addr)
+            return
+
+        if mtype == "SYNC_RESPONSE":
+            print(
+                f"[Node {self.node_id}] Received SYNC_RESPONSE from {sender} at {addr}"
+            )
+            # Let the sync logic pick it up from the queue
+            self.incoming_messages.put(message)
+            return
+
         if mtype in ("PAXOS_PROMISE", "PAXOS_ACCEPTED", "PAXOS_REJECT"):
             print(
                 f"[Node {self.node_id}] Received {mtype} from {sender} at {addr}: "
@@ -177,8 +188,7 @@ class Node:
 
         ballot = Ballot.from_dict(ballot_dict)
 
-        # optional: depth sanity check vs local blockchain
-        local_depth = self.blockchain.get_depth() - 1  # last committed index
+        local_depth = self.blockchain.get_depth() - 1
         if depth < local_depth:
             print(
                 f"[Node {self.node_id}] Ignoring PREPARE for depth {depth} "
@@ -306,6 +316,9 @@ class Node:
 
         try:
             self.blockchain.commit_block_from_value(value)
+            # Persist latest state after commit
+            persistence.save_blockchain(self.node_id, self.blockchain)
+            persistence.save_paxos_state(self.node_id, self.paxos)
         except Exception as e:
             print(
                 f"[Node {self.node_id}] Error committing decided block at depth "
@@ -313,7 +326,174 @@ class Node:
             )
 
     # ------------------------------------------------------------------
-    # Paxos proposer helpers
+    # SYNC / recovery handlers
+    # ------------------------------------------------------------------
+
+    def _handle_sync_request(
+        self, message: Dict[str, Any], addr: Tuple[str, int]
+    ) -> None:
+        requester = message.get("from")
+        payload = message.get("payload", {})
+        req_depth = payload.get("depth")
+        local_depth = self.blockchain.get_depth() - 1
+
+        print(
+            f"[Node {self.node_id}] Received SYNC_REQUEST from Node {requester} "
+            f"(their depth={req_depth}) at {addr}"
+        )
+
+        blocks_data = [b.to_dict() for b in self.blockchain.blocks]
+        accounts_data = {str(k): v for k, v in self.blockchain.accounts.items()}
+
+        resp = {
+            "from": self.node_id,
+            "type": "SYNC_RESPONSE",
+            "payload": {
+                "depth": local_depth,
+                "blocks": blocks_data,
+                "accounts": accounts_data,
+            },
+        }
+
+        if requester is not None:
+            self.network.send_message(requester, resp)
+
+    def _wait_for_sync_response(
+        self, from_id: int, timeout: float = 5.0
+    ) -> Dict[str, Any] | None:
+        """
+        Wait for a SYNC_RESPONSE from a specific node.
+        """
+        end = time.time() + timeout
+        buffer: list[Dict[str, Any]] = []
+
+        while time.time() < end:
+            remaining = end - time.time()
+            if remaining <= 0:
+                break
+            try:
+                msg = self.incoming_messages.get(timeout=remaining)
+            except queue.Empty:
+                break
+
+            mtype = msg.get("type")
+            sender = msg.get("from")
+            if mtype == "SYNC_RESPONSE" and sender == from_id:
+                # Put back other messages
+                for m in buffer:
+                    self.incoming_messages.put(m)
+                return msg
+
+            buffer.append(msg)
+
+        for m in buffer:
+            self.incoming_messages.put(m)
+        return None
+
+    def _apply_sync_state_from_payload(self, payload: Dict[str, Any]) -> None:
+        """
+        Replace local blockchain/accounts with the snapshot from payload.
+        """
+        blocks_data = payload.get("blocks", [])
+        accounts_data = payload.get("accounts", {})
+
+        if not blocks_data:
+            print(
+                f"[Node {self.node_id}] SYNC_RESPONSE has empty blockchain; "
+                f"ignoring."
+            )
+            return
+
+        new_bc = Blockchain(
+            num_nodes=self.num_nodes,
+            initial_balance=self.initial_balance,
+        )
+        new_bc.blocks = [Block.from_dict(bd) for bd in blocks_data]
+        new_bc.accounts = {int(k): v for k, v in accounts_data.items()}
+        self.blockchain = new_bc
+
+        print(
+            f"[Node {self.node_id}] Synced blockchain from peer; "
+            f"new depth={self.blockchain.get_depth() - 1}, "
+            f"balances={self.blockchain.accounts}"
+        )
+
+    def _sync_from_peers(self, timeout_per_peer: float = 5.0) -> None:
+        """
+        Simple recovery strategy: ask peers for their full blockchain and
+        adopt the first one that is longer than ours.
+        """
+        current_depth = self.blockchain.get_depth() - 1
+        peer_ids = sorted(
+            int(k) for k in self.nodes_config.keys() if int(k) != self.node_id
+        )
+
+        if not peer_ids:
+            print(f"[Node {self.node_id}] No peers configured for sync.")
+            return
+
+        print(
+            f"[Node {self.node_id}] Attempting to sync from peers. "
+            f"Current depth={current_depth}"
+        )
+
+        for peer_id in peer_ids:
+            print(
+                f"[Node {self.node_id}] Sending SYNC_REQUEST to Node {peer_id}"
+            )
+            req = {
+                "from": self.node_id,
+                "type": "SYNC_REQUEST",
+                "payload": {"depth": current_depth},
+            }
+            self.network.send_message(peer_id, req)
+
+            resp = self._wait_for_sync_response(peer_id, timeout_per_peer)
+            if resp is None:
+                print(
+                    f"[Node {self.node_id}] No SYNC_RESPONSE from Node {peer_id} "
+                    f"(timeout)."
+                )
+                continue
+
+            pl = resp.get("payload", {})
+            remote_depth = pl.get("depth")
+            if remote_depth is None:
+                print(
+                    f"[Node {self.node_id}] Malformed SYNC_RESPONSE from "
+                    f"Node {peer_id}: {resp}"
+                )
+                continue
+
+            if remote_depth <= current_depth:
+                print(
+                    f"[Node {self.node_id}] Node {peer_id} not ahead "
+                    f"(remote depth={remote_depth}); skipping."
+                )
+                continue
+
+            print(
+                f"[Node {self.node_id}] Syncing from Node {peer_id} "
+                f"(remote depth={remote_depth})."
+            )
+            self._apply_sync_state_from_payload(pl)
+
+            try:
+                persistence.save_blockchain(self.node_id, self.blockchain)
+                persistence.save_paxos_state(self.node_id, self.paxos)
+            except Exception as e:
+                print(
+                    f"[Node {self.node_id}] Error saving state after sync: {e}"
+                )
+            return
+
+        print(
+            f"[Node {self.node_id}] Could not find a peer with a longer "
+            f"blockchain to sync from."
+        )
+
+    # ------------------------------------------------------------------
+    # Paxos proposer helpers (unchanged from previous step)
     # ------------------------------------------------------------------
 
     def _majority(self) -> int:
@@ -322,10 +502,6 @@ class Node:
     def _wait_for_promises(
         self, depth: int, ballot: Ballot, timeout: float = 5.0
     ) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
-        """
-        Wait for PROMISE or REJECT messages for a given (depth, ballot).
-        Returns (promises, rejects).
-        """
         promises: list[Dict[str, Any]] = []
         rejects: list[Dict[str, Any]] = []
         buffer: list[Dict[str, Any]] = []
@@ -347,14 +523,21 @@ class Node:
             msg_depth = payload.get("depth")
             msg_ballot = payload.get("ballot")
 
-            if mtype == "PAXOS_PROMISE" and msg_depth == depth and msg_ballot == ballot.to_dict():
+            if (
+                mtype == "PAXOS_PROMISE"
+                and msg_depth == depth
+                and msg_ballot == ballot.to_dict()
+            ):
                 promises.append(msg)
-            elif mtype == "PAXOS_REJECT" and msg_depth == depth and msg_ballot == ballot.to_dict():
+            elif (
+                mtype == "PAXOS_REJECT"
+                and msg_depth == depth
+                and msg_ballot == ballot.to_dict()
+            ):
                 rejects.append(msg)
             else:
                 buffer.append(msg)
 
-        # Return unrelated messages to the queue
         for m in buffer:
             self.incoming_messages.put(m)
 
@@ -363,10 +546,6 @@ class Node:
     def _wait_for_accepteds(
         self, depth: int, ballot: Ballot, timeout: float = 5.0
     ) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
-        """
-        Wait for ACCEPTED or REJECT messages for a given (depth, ballot).
-        Returns (accepteds, rejects).
-        """
         accepteds: list[Dict[str, Any]] = []
         rejects: list[Dict[str, Any]] = []
         buffer: list[Dict[str, Any]] = []
@@ -388,9 +567,17 @@ class Node:
             msg_depth = payload.get("depth")
             msg_ballot = payload.get("ballot")
 
-            if mtype == "PAXOS_ACCEPTED" and msg_depth == depth and msg_ballot == ballot.to_dict():
+            if (
+                mtype == "PAXOS_ACCEPTED"
+                and msg_depth == depth
+                and msg_ballot == ballot.to_dict()
+            ):
                 accepteds.append(msg)
-            elif mtype == "PAXOS_REJECT" and msg_depth == depth and msg_ballot == ballot.to_dict():
+            elif (
+                mtype == "PAXOS_REJECT"
+                and msg_depth == depth
+                and msg_ballot == ballot.to_dict()
+            ):
                 rejects.append(msg)
             else:
                 buffer.append(msg)
@@ -403,10 +590,6 @@ class Node:
     def _build_block_value(
         self, depth: int, sender_id: int, receiver_id: int, amount: int
     ) -> Dict[str, Any]:
-        """
-        Build a block value dict (transaction + nonce + hash pointer)
-        to be proposed at a given depth.
-        """
         tx = Transaction(sender_id=sender_id, receiver_id=receiver_id, amount=amount)
         print(f"[Node {self.node_id}] Building block value for depth {depth}: {tx}")
 
@@ -430,11 +613,6 @@ class Node:
     def _paxos_propose_transaction(
         self, sender_id: int, receiver_id: int, amount: int
     ) -> None:
-        """
-        Full Paxos round for a single transaction:
-        PREPARE -> (majority PROMISE) -> choose value -> ACCEPT ->
-        (majority ACCEPTED) -> DECISION.
-        """
         depth = self.blockchain.get_depth()  # next block index
         self._seq_counter += 1
         ballot = Ballot(depth=depth, seq=self._seq_counter, proc_id=self.node_id)
@@ -444,7 +622,7 @@ class Node:
             f"ballot {ballot}, tx {sender_id}->{receiver_id} amount={amount}"
         )
 
-        # PREPARE phase (include self as acceptor)
+        # PREPARE (include self)
         ok, accepted_ballot, accepted_value = self.paxos.on_prepare(depth, ballot)
         if not ok:
             raise RuntimeError("Local acceptor rejected our own PREPARE")
@@ -467,7 +645,6 @@ class Node:
         }
         promises = [local_promise_msg]
 
-        # Broadcast PREPARE to all other nodes
         prepare_payload = {
             "depth": depth,
             "ballot": ballot.to_dict(),
@@ -488,11 +665,9 @@ class Node:
                 f"(got {len(promises)}, need {self._majority()})"
             )
 
-        # Choose value: if any PROMISE has an accepted_value, use the one
-        # with highest accepted_ballot; otherwise, use new transaction.
+        # Choose value
         highest_ab = None
         chosen_value = None
-
         for m in promises:
             pl = m["payload"]
             ab = pl.get("accepted_ballot")
@@ -511,7 +686,7 @@ class Node:
                 f"from ballot {highest_ab}"
             )
 
-        # ACCEPT phase (include self as acceptor)
+        # ACCEPT (include self)
         ok = self.paxos.on_accept(depth, ballot, chosen_value)
         if not ok:
             raise RuntimeError("Local acceptor rejected our own ACCEPT")
@@ -553,10 +728,12 @@ class Node:
             f"ballot {ballot}"
         )
 
-        # Commit locally
+        # Commit locally + persist
         self.blockchain.commit_block_from_value(chosen_value)
+        persistence.save_blockchain(self.node_id, self.blockchain)
+        persistence.save_paxos_state(self.node_id, self.paxos)
 
-        # Broadcast DECISION so others commit too
+        # Broadcast DECISION
         decision_msg = {
             "from": self.node_id,
             "type": "PAXOS_DECISION",
@@ -573,16 +750,10 @@ class Node:
         )
 
     # ------------------------------------------------------------------
-    # Public operations (CLI calls these)
+    # Public operations (CLI)
     # ------------------------------------------------------------------
 
     def money_transfer(self, debit_id: int, credit_id: int, amount: int) -> None:
-        """
-        Initiate a transfer from debit_id to credit_id, using Paxos
-        to agree on the next block at the current depth.
-
-        Requirement: debit_id must be this node's id.
-        """
         if debit_id != self.node_id:
             raise ValueError(
                 f"This node ({self.node_id}) can only initiate debits from its own "
@@ -591,7 +762,6 @@ class Node:
         if debit_id == credit_id:
             raise ValueError("Sender and receiver must be different")
 
-        # Validate funds against our local view before starting Paxos
         if not self.blockchain.validate_transaction(debit_id, amount):
             raise ValueError("Invalid or insufficient-balance transaction")
 
@@ -603,8 +773,14 @@ class Node:
         self._paxos_propose_transaction(debit_id, credit_id, amount)
 
     def print_balances(self) -> None:
+        """
+        Print the balance of all accounts on this node.
+
+        Spec wants all 5 accounts; we just iterate over whatever accounts
+        exist in the blockchain.accounts dict, sorted by node id.
+        """
         print(f"[Node {self.node_id}] Balances:")
-        for nid in range(1, self.num_nodes + 1):
+        for nid in sorted(self.blockchain.accounts.keys()):
             bal = self.blockchain.get_balance(nid)
             print(f"  Node {nid}: ${bal}")
         print(f"  Total: ${self.blockchain.total_balance()}\n")
@@ -629,19 +805,15 @@ class Node:
         self.network.send_message(target_id, msg)
 
     def show_messages(self) -> None:
-        """
-        Drain and print incoming messages (PROMISE, ACCEPTED, PING, etc.).
-        """
         print(f"[Node {self.node_id}] Incoming message queue:")
         if self.incoming_messages.empty():
             print("  (no messages)")
             return
-
         while not self.incoming_messages.empty():
             msg = self.incoming_messages.get_nowait()
             print(" ", msg)
 
-    # ----- Paxos CLI helpers (manual testing still available) ----------
+    # ----- Paxos CLI helpers (manual testing) --------------------------
 
     def send_prepare(self, target_id: int, depth: int, seq: int) -> None:
         ballot = Ballot(depth=depth, seq=seq, proc_id=self.node_id)
@@ -690,32 +862,57 @@ class Node:
     def show_paxos_state(self, depth: int) -> None:
         print(self.paxos.dump_depth_state(depth))
 
-    # ----- Failure stubs -----------------------------------------------
+    # ----- Failure stubs now integrated with persistence + sync --------
 
     def fail_process(self) -> None:
         """
-        Stub for crash: mark not running and stop network listener.
+        Simulate a crash:
+
+        - Save blockchain + Paxos state to disk
+        - Stop network
+        - Mark node as not running
         """
         print(
             f"[Node {self.node_id}] failProcess called. "
-            f"Marking node as not running and stopping network."
+            f"Saving state and stopping network."
         )
+        try:
+            persistence.save_blockchain(self.node_id, self.blockchain)
+            persistence.save_paxos_state(self.node_id, self.paxos)
+        except Exception as e:
+            print(f"[Node {self.node_id}] Error saving state on failProcess: {e}")
+
         self.running = False
         if self.network:
             self.network.stop()
 
     def fix_process(self) -> None:
         """
-        Stub for recovery.
+        Simulate a recovery:
 
-        For now, just mark running and (re)start network.
+        - Reload blockchain + Paxos state from disk
+        - Restart network listener
+        - Sync from any peer that has a longer chain
+        - Mark node as running
         """
         print(
             f"[Node {self.node_id}] fixProcess called. "
-            f"Marking node as running and starting network."
+            f"Reloading state and starting network."
         )
+
+        # Reload state from disk
+        self.blockchain = persistence.load_blockchain(
+            self.node_id, self.num_nodes, self.initial_balance
+        )
+        self.paxos = PaxosState(self.node_id)
+        persistence.load_paxos_state(self.node_id, self.paxos)
+
+        # Restart network
         self.running = True
         if self.network:
             self.network.start()
         else:
             self.network = self._init_network()
+
+        # Try to catch up if behind
+        self._sync_from_peers()
