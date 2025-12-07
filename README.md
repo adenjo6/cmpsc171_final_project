@@ -1,83 +1,83 @@
 Open 5 terminals, all in .../cmpsc171_final_project/src:
 
-python main.py --node-id 1 --num-nodes 5
-python main.py --node-id 2 --num-nodes 5
-python main.py --node-id 3 --num-nodes 5
-python main.py --node-id 4 --num-nodes 5
-python main.py --node-id 5 --num-nodes 5
+- python main.py --node-id 1 --num-nodes 5
+- python main.py --node-id 2 --num-nodes 5
+- python main.py --node-id 3 --num-nodes 5
+- python main.py --node-id 4 --num-nodes 5
+- python main.py --node-id 5 --num-nodes 5
 
 (Optional) reset state: If you want to demo from a fresh history, delete the data/node_* folders
 
 # Basic sequential transfers
 On Node 1:
-node1> printBalance
-node1> printBlockchain   # shows just genesis
+- node1> printBalance
+- node1> printBlockchain   # shows just genesis
 
 Then:
-node1> moneyTransfer 1 2 10
+- node1> moneyTransfer 1 2 10
 
 After Paxos finishes:
-node1> printBalance
-node2> printBalance
-node3> printBalance
-node4> printBalance
-node5> printBalance
+- node1> printBalance
+- node2> printBalance
+- node3> printBalance
+- node4> printBalance
+- node5> printBalance
 
 Also:
-node3> printBlockchain
-Shows the same new block (index 1) as nodes 1 and 2.
+- node3> printBlockchain
+- Shows the same new block (index 1) as nodes 1 and 2.
 
 # Concurrent transfers / multiple leaders
 On Node 3 (right after the previous finishes):
-node3> moneyTransfer 3 4 15
+- node3> moneyTransfer 3 4 15
 Almost at the same time, on Node 5:
-node5> moneyTransfer 5 1 20
+- node5> moneyTransfer 5 1 20
 Some possibilities:
-One leader wins for depth 2, the other sees rejects or timeouts and fails (you can re-run).
-Or the two operations land as depth 2 and depth 3 in some order.
+- One leader wins for depth 2, the other sees rejects or timeouts and fails (you can re-run).
+- Or the two operations land as depth 2 and depth 3 in some order.
 
 What’s going on conceptually
-You started two concurrent leaders at the same depth:
-Node 3 proposes: 3 -> 4, 15 with ballot (d=2, s=1, p=3)
-Node 5 proposes: 5 -> 1, 20 with ballot (d=2, s=1, p=5)
-Remember our ballot ordering: (depth, seq, proc_id) – and higher is “newer / stronger”.
-At the same depth (2) and same seq (1):
-(2, 1, 5) > (2, 1, 3) because proc_id 5 > 3
-So Node 5’s proposal has the higher ballot and should win in Paxos.
+- You started two concurrent leaders at the same depth:
+- Node 3 proposes: 3 -> 4, 15 with ballot (d=2, s=1, p=3)
+- Node 5 proposes: 5 -> 1, 20 with ballot (d=2, s=1, p=5)
+- Remember our ballot ordering: (depth, seq, proc_id) – and higher is “newer / stronger”.
+- At the same depth (2) and same seq (1):
+- (2, 1, 5) > (2, 1, 3) because proc_id 5 > 3
+- So Node 5’s proposal has the higher ballot and should win in Paxos.
 
 # Crash one node, keep going, then recover it
 Crash Node 4:
-node4> failProcess
-Point out: Node 4’s network stops; it won’t reply to Paxos messages now.
+- node4> failProcess
+- Point out: Node 4’s network stops; it won’t reply to Paxos messages now.
 While Node 4 is down, do a transfer:
-node1> moneyTransfer 1 3 5
-Paxos should still succeed, because nodes 1,2,3,5 form a majority of 5.
+- node1> moneyTransfer 1 3 5
+- Paxos should still succeed, because nodes 1,2,3,5 form a majority of 5.
 Show that Node 4 is stale:
-node4> printBalance
-Its balances will not include the latest transfer yet.
+- node4> printBalance
+- Its balances will not include the latest transfer yet.
 Restore Node 4:
-node4> fixProcess
-Watch logs: it reloads from disk and calls _sync_from_peers() via SYNC_REQUEST/RESPONSE.
+- node4> fixProcess
+- Watch logs: it reloads from disk and calls _sync_from_peers() via SYNC_REQUEST/RESPONSE.
 
 # Majority failure (system stalls correctly)
 With 5 nodes, to have no majority you need fewer than 3 alive.
-So you must leave only 1 or 2 nodes running. For example:
+- So you must leave only 1 or 2 nodes running. For example:
 
 Option A – Leave only 1 alive
-Keep Node 1 alive, crash the other 4:
-node2> failProcess
-node3> failProcess
-node4> failProcess
-node5> failProcess
+- Keep Node 1 alive, crash the other 4:
+- node2> failProcess
+- node3> failProcess
+- node4> failProcess
+- node5> failProcess
 
 Now try:
-node1> moneyTransfer 1 2 10
+- node1> moneyTransfer 1 2 10
 Result you should see:
-PREPARE/ACCEPT only go from 1 → 1 (local call) and fail to connect to others.
-_wait_for_promises or _wait_for_accepteds times out with something like:
-Did not receive majority PROMISEs (got 1, need 3)
-No new block is committed.
-printBlockchain and printBalance show unchanged state.
+- PREPARE/ACCEPT only go from 1 → 1 (local call) and fail to connect to others.
+- _wait_for_promises or _wait_for_accepteds times out with something like:
+- Did not receive majority PROMISEs (got 1, need 3)
+- No new block is committed.
+- printBlockchain and printBalance show unchanged state.
 
 # Implementation Plan: Distributed Blockchain with Paxos Consensus
 
