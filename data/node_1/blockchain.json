@@ -21,12 +21,23 @@
       "nonce": "aH9bVoOQsf8YdUKs",
       "hash": "7669a0be645f7722dfd3d8f25678e809b1a0fa30b2d85b4d3c7ce37a7fc0e33d",
       "status": "decided"
+    },
+    {
+      "index": 2,
+      "transaction": {
+        "sender_id": 2,
+        "receiver_id": 3,
+        "amount": 5
+      },
+      "nonce": "KJDB5sxQy0ieHOlA",
+      "hash": "e3d3781bc5bbbe21783cf862a7f7d1a647b03fa63a869afa0d94332d946f5ae2",
+      "status": "decided"
     }
   ],
   "accounts": {
     "1": 90,
-    "2": 110,
-    "3": 100,
+    "2": 105,
+    "3": 105,
     "4": 100,
     "5": 100
   }
