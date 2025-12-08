@@ -1,0 +1,27 @@
+{
+  "depths": {
+    "1": {
+      "promised": {
+        "depth": 1,
+        "seq": 1,
+        "proc_id": 1
+      },
+      "accepted_ballot": {
+        "depth": 1,
+        "seq": 1,
+        "proc_id": 1
+      },
+      "accepted_value": {
+        "index": 1,
+        "transaction": {
+          "sender_id": 1,
+          "receiver_id": 2,
+          "amount": 10
+        },
+        "nonce": "aH9bVoOQsf8YdUKs",
+        "hash": "7669a0be645f7722dfd3d8f25678e809b1a0fa30b2d85b4d3c7ce37a7fc0e33d",
+        "status": "tentative"
+      }
+    }
+  }
+}

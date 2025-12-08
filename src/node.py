@@ -46,6 +46,9 @@ class Node:
         # Proposer sequence number (for ballots)
         self._seq_counter: int = 0
 
+        # Extra credit: track first uncommitted index for incremental repair
+        self.first_uncommitted_index: int = 0
+
         # Load cluster config
         self.nodes_config = self._load_nodes_config()
 
@@ -54,6 +57,9 @@ class Node:
             self.node_id, self.num_nodes, self.initial_balance
         )
         persistence.load_paxos_state(self.node_id, self.paxos)
+
+        # Initialize first_uncommitted_index based on loaded blockchain
+        self._update_first_uncommitted_index()
 
         # Start network listener
         self.network = self._init_network()
@@ -140,6 +146,21 @@ class Node:
                 f"[Node {self.node_id}] Received SYNC_RESPONSE from {sender} at {addr}"
             )
             # Let the sync logic pick it up from the queue
+            self.incoming_messages.put(message)
+            return
+
+        if mtype == "REPAIR_BLOCKS":
+            self._handle_repair_blocks(message, addr)
+            return
+
+        if mtype == "REPAIR_REQUEST":
+            self._handle_repair_request(message, addr)
+            return
+
+        if mtype == "REPAIR_RESPONSE":
+            print(
+                f"[Node {self.node_id}] Received REPAIR_RESPONSE from {sender} at {addr}"
+            )
             self.incoming_messages.put(message)
             return
 
@@ -266,6 +287,7 @@ class Node:
                     "depth": depth,
                     "ballot": ballot.to_dict(),
                     "value": value,
+                    "first_uncommitted_index": self.first_uncommitted_index,  # Extra credit
                 },
             }
             self.network.send_message(sender, reply)
@@ -314,6 +336,273 @@ class Node:
                 f"[Node {self.node_id}] Error committing decided block at depth "
                 f"{depth}: {e}"
             )
+
+    # ------------------------------------------------------------------
+    # Extra credit: first_uncommitted_index tracking
+    # ------------------------------------------------------------------
+
+    def _update_first_uncommitted_index(self) -> None:
+        """
+        Update first_uncommitted_index to point to the first block after
+        all consecutive decided blocks from the beginning.
+
+        For simplicity, we set it to the current blockchain depth,
+        assuming all blocks up to this point are decided.
+        """
+        # Count consecutive decided blocks from start
+        for i, block in enumerate(self.blockchain.blocks):
+            if block.status != "decided":
+                self.first_uncommitted_index = i
+                return
+
+        # All blocks are decided
+        self.first_uncommitted_index = len(self.blockchain.blocks)
+
+    # ------------------------------------------------------------------
+    # Extra credit: incremental repair handlers
+    # ------------------------------------------------------------------
+
+    def _handle_repair_blocks(
+        self, message: Dict[str, Any], addr: Tuple[str, int]
+    ) -> None:
+        """
+        Handle REPAIR_BLOCKS message: acceptor receives missing blocks from leader.
+        """
+        sender = message.get("from")
+        payload = message.get("payload", {})
+        start_index = payload.get("start_index")
+        blocks_data = payload.get("blocks", [])
+
+        if sender is None or start_index is None:
+            print(
+                f"[Node {self.node_id}] Malformed REPAIR_BLOCKS from {addr}: {message}"
+            )
+            return
+
+        print(
+            f"[Node {self.node_id}] Received REPAIR_BLOCKS from Node {sender}: "
+            f"start_index={start_index}, count={len(blocks_data)}"
+        )
+
+        # Apply missing blocks
+        for i, block_dict in enumerate(blocks_data):
+            block_index = start_index + i
+
+            # Skip blocks we already have
+            if block_index < len(self.blockchain.blocks):
+                print(
+                    f"[Node {self.node_id}] Skipping block {block_index} "
+                    f"(already have it)"
+                )
+                continue
+
+            # Append new blocks
+            block = Block.from_dict(block_dict)
+            self.blockchain.blocks.append(block)
+            print(
+                f"[Node {self.node_id}] Repaired block {block_index}: "
+                f"{block.transaction}"
+            )
+
+        # Rebuild accounts from blockchain
+        self.blockchain.rebuild_accounts()
+
+        # Update first_uncommitted_index
+        self._update_first_uncommitted_index()
+
+        # Persist updated state
+        try:
+            persistence.save_blockchain(self.node_id, self.blockchain)
+            persistence.save_paxos_state(self.node_id, self.paxos)
+            print(
+                f"[Node {self.node_id}] Repair complete. "
+                f"New depth={self.blockchain.get_depth() - 1}"
+            )
+        except Exception as e:
+            print(
+                f"[Node {self.node_id}] Error saving state after repair: {e}"
+            )
+
+    def _handle_repair_request(
+        self, message: Dict[str, Any], addr: Tuple[str, int]
+    ) -> None:
+        """
+        Handle REPAIR_REQUEST message: leader requests missing blocks from acceptor.
+        """
+        requester = message.get("from")
+        payload = message.get("payload", {})
+        start_index = payload.get("start_index")
+        end_index = payload.get("end_index")
+
+        if requester is None or start_index is None or end_index is None:
+            print(
+                f"[Node {self.node_id}] Malformed REPAIR_REQUEST from {addr}: "
+                f"{message}"
+            )
+            return
+
+        print(
+            f"[Node {self.node_id}] Received REPAIR_REQUEST from Node {requester}: "
+            f"range=[{start_index}, {end_index})"
+        )
+
+        # Extract requested blocks
+        blocks_data = []
+        for i in range(start_index, min(end_index, len(self.blockchain.blocks))):
+            blocks_data.append(self.blockchain.blocks[i].to_dict())
+
+        # Send response
+        response = {
+            "from": self.node_id,
+            "type": "REPAIR_RESPONSE",
+            "payload": {
+                "start_index": start_index,
+                "blocks": blocks_data,
+            },
+        }
+
+        print(
+            f"[Node {self.node_id}] Sending REPAIR_RESPONSE to Node {requester}: "
+            f"{len(blocks_data)} blocks"
+        )
+        self.network.send_message(requester, response)
+
+    def _wait_for_repair_response(
+        self, from_id: int, timeout: float = 5.0
+    ) -> Dict[str, Any] | None:
+        """
+        Wait for a REPAIR_RESPONSE from a specific node.
+        """
+        end = time.time() + timeout
+        buffer: list[Dict[str, Any]] = []
+
+        while time.time() < end:
+            remaining = end - time.time()
+            if remaining <= 0:
+                break
+            try:
+                msg = self.incoming_messages.get(timeout=remaining)
+            except queue.Empty:
+                break
+
+            mtype = msg.get("type")
+            sender = msg.get("from")
+            if mtype == "REPAIR_RESPONSE" and sender == from_id:
+                # Put back other messages
+                for m in buffer:
+                    self.incoming_messages.put(m)
+                return msg
+
+            buffer.append(msg)
+
+        for m in buffer:
+            self.incoming_messages.put(m)
+        return None
+
+    def _check_and_repair_from_accepteds(
+        self, accepteds: list[Dict[str, Any]]
+    ) -> None:
+        """
+        Extra credit: Check first_uncommitted_index from ACCEPTED messages
+        and trigger incremental repair if needed.
+
+        Called after achieving majority ACCEPTEDs.
+        """
+        my_index = self.first_uncommitted_index
+
+        for msg in accepteds:
+            sender_id = msg.get("from")
+            payload = msg.get("payload", {})
+            acceptor_index = payload.get("first_uncommitted_index")
+
+            if acceptor_index is None or sender_id is None:
+                continue  # Skip if index not present (shouldn't happen)
+
+            # Case 1: Acceptor is behind - send missing blocks
+            if acceptor_index < my_index:
+                print(
+                    f"[Node {self.node_id}] Extra Credit: Detected Node {sender_id} "
+                    f"is behind (index {acceptor_index} < {my_index}). "
+                    f"Sending repair..."
+                )
+
+                missing_blocks = []
+                for i in range(acceptor_index, my_index):
+                    if i < len(self.blockchain.blocks):
+                        missing_blocks.append(self.blockchain.blocks[i].to_dict())
+
+                repair_msg = {
+                    "from": self.node_id,
+                    "type": "REPAIR_BLOCKS",
+                    "payload": {
+                        "start_index": acceptor_index,
+                        "blocks": missing_blocks,
+                    },
+                }
+                self.network.send_message(sender_id, repair_msg)
+                print(
+                    f"[Node {self.node_id}] Sent {len(missing_blocks)} blocks "
+                    f"to Node {sender_id}"
+                )
+
+            # Case 2: I am behind - request missing blocks
+            elif acceptor_index > my_index:
+                print(
+                    f"[Node {self.node_id}] Extra Credit: Detected I am behind "
+                    f"(my index {my_index} < Node {sender_id} index {acceptor_index}). "
+                    f"Requesting repair..."
+                )
+
+                request_msg = {
+                    "from": self.node_id,
+                    "type": "REPAIR_REQUEST",
+                    "payload": {
+                        "start_index": my_index,
+                        "end_index": acceptor_index,
+                    },
+                }
+                self.network.send_message(sender_id, request_msg)
+
+                # Wait for response
+                response = self._wait_for_repair_response(sender_id, timeout=5.0)
+                if response:
+                    resp_payload = response.get("payload", {})
+                    start_index = resp_payload.get("start_index")
+                    blocks_data = resp_payload.get("blocks", [])
+
+                    print(
+                        f"[Node {self.node_id}] Received {len(blocks_data)} blocks "
+                        f"from Node {sender_id}"
+                    )
+
+                    # Apply the missing blocks
+                    for i, block_dict in enumerate(blocks_data):
+                        block_index = start_index + i
+                        if block_index >= len(self.blockchain.blocks):
+                            block = Block.from_dict(block_dict)
+                            self.blockchain.blocks.append(block)
+
+                    # Rebuild accounts and update index
+                    self.blockchain.rebuild_accounts()
+                    self._update_first_uncommitted_index()
+
+                    # Persist
+                    try:
+                        persistence.save_blockchain(self.node_id, self.blockchain)
+                        persistence.save_paxos_state(self.node_id, self.paxos)
+                        print(
+                            f"[Node {self.node_id}] Repair complete. "
+                            f"New depth={self.blockchain.get_depth() - 1}"
+                        )
+                    except Exception as e:
+                        print(
+                            f"[Node {self.node_id}] Error saving after repair: {e}"
+                        )
+                else:
+                    print(
+                        f"[Node {self.node_id}] No REPAIR_RESPONSE from "
+                        f"Node {sender_id} (timeout)"
+                    )
 
     # ------------------------------------------------------------------
     # SYNC / recovery handlers
@@ -688,6 +977,7 @@ class Node:
                 "depth": depth,
                 "ballot": ballot.to_dict(),
                 "value": chosen_value,
+                "first_uncommitted_index": self.first_uncommitted_index,  # Extra credit
             },
         }
         accepteds = [local_accepted_msg]
@@ -696,6 +986,7 @@ class Node:
             "depth": depth,
             "ballot": ballot.to_dict(),
             "value": chosen_value,
+            "first_uncommitted_index": self.first_uncommitted_index,  # Extra credit
         }
         accept_msg = {
             "from": self.node_id,
@@ -718,8 +1009,12 @@ class Node:
             f"ballot {ballot}"
         )
 
+        # Extra credit: Check for index mismatches and trigger repairs
+        self._check_and_repair_from_accepteds(accepteds)
+
         # Commit locally + persist
         self.blockchain.commit_block_from_value(chosen_value)
+        self._update_first_uncommitted_index()  # Extra credit: update after commit
         persistence.save_blockchain(self.node_id, self.blockchain)
         persistence.save_paxos_state(self.node_id, self.paxos)
 
@@ -730,6 +1025,7 @@ class Node:
             "payload": {
                 "depth": depth,
                 "value": chosen_value,
+                "first_uncommitted_index": self.first_uncommitted_index,  # Extra credit
             },
         }
         self.network.broadcast(decision_msg)

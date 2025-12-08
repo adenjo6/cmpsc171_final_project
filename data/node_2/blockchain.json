@@ -1,0 +1,33 @@
+{
+  "blocks": [
+    {
+      "index": 0,
+      "transaction": {
+        "sender_id": 0,
+        "receiver_id": 0,
+        "amount": 0
+      },
+      "nonce": "GENESIS",
+      "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "status": "decided"
+    },
+    {
+      "index": 1,
+      "transaction": {
+        "sender_id": 1,
+        "receiver_id": 2,
+        "amount": 10
+      },
+      "nonce": "aH9bVoOQsf8YdUKs",
+      "hash": "7669a0be645f7722dfd3d8f25678e809b1a0fa30b2d85b4d3c7ce37a7fc0e33d",
+      "status": "decided"
+    }
+  ],
+  "accounts": {
+    "1": 90,
+    "2": 110,
+    "3": 100,
+    "4": 100,
+    "5": 100
+  }
+}
