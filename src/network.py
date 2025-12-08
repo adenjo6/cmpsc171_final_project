@@ -11,15 +11,6 @@ OnMessageCallback = Callable[[Message, Tuple[str, int]], None]
 
 
 class Network:
-    """
-    Simple TCP-based network layer.
-
-    - Each node listens on its (host, port)
-    - Messages are JSON {"from": int, "type": str, "payload": {...}}
-    - One message per connection (for simplicity)
-    - 'delay' introduces a constant delay before sending (in seconds)
-    """
-
     def __init__(
         self,
         node_id: int,

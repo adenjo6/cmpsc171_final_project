@@ -9,7 +9,6 @@ from dataclasses import dataclass, asdict
 
 @dataclass
 class Transaction:
-    """Represents a single money transfer <sender, receiver, amount>."""
     sender_id: int
     receiver_id: int
     amount: int
@@ -26,42 +25,25 @@ class Transaction:
         )
 
     def canonical_string(self) -> str:
-        """Stable string representation used in hashing."""
         return f"{self.sender_id},{self.receiver_id},{self.amount}"
 
 
 @dataclass
 class Block:
-    """
-    Block structure.
-
-    index  : depth/index in the chain (0 = genesis)
-    hash   : hash pointer to the previous block, per project spec
-    nonce  : random string that makes SHA256(Txns || Nonce) end with 0-4
-    status : 'tentative' or 'decided' (for Paxos, later)
-    """
     index: int
     transaction: Transaction
     nonce: str
-    hash: str  # Hash pointer to the previous block
+    hash: str  
     status: str = "tentative"
 
     @staticmethod
     def compute_pow_hash(transaction: Transaction, nonce: str) -> str:
-        """
-        Equation (2): h = SHA256(Txns || Nonce)
-        Used only for proof-of-work nonce validity.
-        """
+
         data = f"{transaction.canonical_string()}|{nonce}"
         return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
     @staticmethod
     def find_nonce(transaction: Transaction, max_attempts: int = None):
-        """
-        Find a nonce such that SHA256(Txns || Nonce) ends with a digit 0-4.
-
-        Returns: (nonce, pow_hash)
-        """
         alphabet = string.ascii_letters + string.digits
         attempts = 0
 
@@ -83,11 +65,6 @@ class Block:
 
     @staticmethod
     def compute_hash_pointer(prev_block: "Block | None") -> str:
-        """
-        Equation (1): T_{n+1}.Hash = SHA256(T_n.Txns || T_n.Nonce || T_n.Hash)
-
-        If prev_block is None (genesis), we return 64 zeros.
-        """
         if prev_block is None:
             # Genesis "previous hash"
             return "0" * 64

@@ -8,14 +8,6 @@ from typing import Any, Dict, Optional
 
 @dataclass(frozen=True, order=True)
 class Ballot:
-    """
-    Ballot number for Paxos.
-
-    Ordered by:
-      depth (block index),
-      then seq (per-node sequence),
-      then proc_id (tie-breaker).
-    """
     depth: int
     seq: int
     proc_id: int
@@ -41,13 +33,6 @@ class Ballot:
 
 @dataclass
 class AcceptorState:
-    """
-    Per-depth acceptor state.
-
-    - promised: highest ballot we've promised not to go below
-    - accepted_ballot: ballot of the value we have accepted (if any)
-    - accepted_value: the accepted value (block data as dict) or None
-    """
     promised: Optional[Ballot] = None
     accepted_ballot: Optional[Ballot] = None
     accepted_value: Optional[Dict[str, Any]] = None
@@ -81,13 +66,6 @@ class AcceptorState:
 
 
 class PaxosState:
-    """
-    Holds acceptor state for all depths in this node.
-
-    Proposer logic lives in the Node layer (using this state),
-    not inside this class.
-    """
-
     def __init__(self, node_id: int):
         self.node_id = node_id
         # depth -> AcceptorState
@@ -109,12 +87,6 @@ class PaxosState:
     def on_prepare(
         self, depth: int, ballot: Ballot
     ) -> tuple[bool, Optional[Ballot], Optional[Dict[str, Any]]]:
-        """
-        Handle a PREPARE(depth, ballot) at this node.
-
-        Returns:
-            (ok, accepted_ballot, accepted_value)
-        """
         acc = self._get_acceptor(depth)
         if acc.promised is None or ballot >= acc.promised:
             acc.promised = ballot
@@ -126,13 +98,6 @@ class PaxosState:
     def on_accept(
         self, depth: int, ballot: Ballot, value: Dict[str, Any]
     ) -> bool:
-        """
-        Handle an ACCEPT(depth, ballot, value) at this node.
-
-        Returns:
-            True if we accept the value for this ballot,
-            False if we reject (ballot < promised).
-        """
         acc = self._get_acceptor(depth)
         if acc.promised is None or ballot >= acc.promised:
             acc.promised = ballot
@@ -148,17 +113,7 @@ class PaxosState:
     # ------------------------------------------------------------------
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Serialize Paxos acceptor state as a dict:
 
-        {
-          "depths": {
-             "1": { acceptor_state_dict },
-             "2": { ... },
-             ...
-          }
-        }
-        """
         depths: Dict[str, Any] = {}
         for depth, acc in self._acceptors.items():
             depths[str(depth)] = acc.to_dict()

@@ -6,23 +6,6 @@ from block import Block, Transaction
 
 
 class Blockchain:
-    """
-    Blockchain + Bank Accounts Table.
-
-    - blocks: list of Block objects starting with a genesis block
-    - accounts: {node_id: balance}
-
-    There are two main usage patterns:
-
-    1) Local, no-Paxos testing:
-       - use append_transaction() to create PoW, append, and update balances.
-
-    2) Paxos-based commit:
-       - leader builds a block value (dict) with PoW + hash pointer,
-       - Paxos decides that value,
-       - all nodes call commit_block_from_value() to append and update balances.
-    """
-
     def __init__(self, num_nodes: int = 5, initial_balance: int = 100):
         self.blocks: List[Block] = []
         # Bank Accounts Table: all nodes start with the same initial balance
@@ -55,7 +38,6 @@ class Blockchain:
         return sum(self.accounts.values())
 
     def validate_transaction(self, sender_id: int, amount: int) -> bool:
-        """Check that sender exists and has sufficient funds."""
         if sender_id not in self.accounts:
             return False
         if amount <= 0:
@@ -63,12 +45,7 @@ class Blockchain:
         return self.accounts[sender_id] >= amount
 
     def apply_transaction(self, tx: Transaction) -> None:
-        """
-        Apply a transaction to the bank accounts table.
 
-        In the full system, this should only be called when the block
-        containing tx is decided and committed.
-        """
         if tx.sender_id not in self.accounts or tx.receiver_id not in self.accounts:
             raise ValueError("Invalid sender or receiver id")
 
@@ -94,14 +71,7 @@ class Blockchain:
     def append_transaction(
         self, sender_id: int, receiver_id: int, amount: int, status: str = "decided"
     ) -> Block:
-        """
-        Append a new block with the given transaction, computing PoW
-        and hash pointer locally.
 
-        This is useful for simple testing, but in the Paxos version the
-        leader will instead build a block value and call
-        commit_block_from_value() after consensus.
-        """
         if not self.validate_transaction(sender_id, amount):
             raise ValueError("Invalid or insufficient-balance transaction")
 
@@ -123,7 +93,6 @@ class Blockchain:
         )
 
         self.blocks.append(new_block)
-        # In the full system, you would only apply the transaction once the block is "decided"
         self.apply_transaction(tx)
 
         print(
@@ -138,23 +107,11 @@ class Blockchain:
     # === Paxos-based commit helper =====================================
 
     def commit_block_from_value(self, block_data: dict) -> Block:
-        """
-        Commit a decided block represented as a value dict that came
-        from Paxos (accepted_value / DECISION).
-
-        block_data is expected to have keys:
-          - index
-          - transaction: {"sender_id", "receiver_id", "amount"}
-          - nonce
-          - hash  (hash pointer to previous block)
-          - status (ignored; we force 'decided')
-        """
         index = block_data["index"]
         tx = Transaction.from_dict(block_data["transaction"])
         nonce = block_data["nonce"]
         hash_pointer = block_data["hash"]
 
-        # If we already have a block at this index, check if it's the same.
         if index < len(self.blocks):
             existing = self.blocks[index]
             if (
@@ -167,21 +124,18 @@ class Blockchain:
                 )
                 return existing
             else:
-                # Conflicting history – in a real system we’d need recovery.
                 print(
                     f"[Blockchain] WARNING: conflicting block at index {index}; "
                     f"existing={existing.to_dict()}, new={block_data}"
                 )
                 return existing
 
-        # Expect the new block to be appended at the end.
         if index != len(self.blocks):
             raise ValueError(
                 f"Cannot commit block with index {index}; "
                 f"expected next index {len(self.blocks)}"
             )
 
-        # Verify hash pointer matches our current last block.
         prev_block = self.latest_block()
         expected_hash = Block.compute_hash_pointer(prev_block)
         if hash_pointer != expected_hash:
@@ -190,7 +144,6 @@ class Blockchain:
                 f"expected {expected_hash}, got {hash_pointer}"
             )
 
-        # Apply transaction and append block as decided.
         self.apply_transaction(tx)
 
         block = Block(

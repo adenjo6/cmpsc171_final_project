@@ -10,7 +10,6 @@ from paxos import PaxosState
 
 
 def _project_root() -> str:
-    """Return absolute path to project root (where data/ lives)."""
     this_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.normpath(os.path.join(this_dir, ".."))
 
@@ -35,15 +34,6 @@ def _paxos_path(node_id: int) -> str:
 # ----------------------------------------------------------------------
 
 def save_blockchain(node_id: int, blockchain: Blockchain) -> None:
-    """
-    Save blockchain blocks + accounts to disk for this node.
-
-    Format:
-    {
-      "blocks": [block_dict, ...],
-      "accounts": {"1": 100, "2": 110, ...}
-    }
-    """
     data = {
         "blocks": [b.to_dict() for b in blockchain.blocks],
         "accounts": {str(k): v for k, v in blockchain.accounts.items()},
@@ -60,13 +50,7 @@ def load_blockchain(
     num_nodes: int,
     initial_balance: int,
 ) -> Blockchain:
-    """
-    Load blockchain + accounts from disk if available.
-    If not present, create a fresh Blockchain.
 
-    NOTE: This trusts the saved accounts and blocks; we do *not*
-    recompute accounts by replaying blocks yet (that can be added later).
-    """
     path = _blockchain_path(node_id)
     if not os.path.exists(path):
         print(
@@ -80,7 +64,6 @@ def load_blockchain(
 
     bc = Blockchain(num_nodes=num_nodes, initial_balance=initial_balance)
 
-    # Replace genesis and accounts with loaded data
     bc.blocks = [Block.from_dict(bdict) for bdict in data["blocks"]]
     bc.accounts = {int(k): v for k, v in data["accounts"].items()}
 
@@ -96,9 +79,6 @@ def load_blockchain(
 # ----------------------------------------------------------------------
 
 def save_paxos_state(node_id: int, paxos: PaxosState) -> None:
-    """
-    Save Paxos acceptor state to disk.
-    """
     data = paxos.to_dict()
     path = _paxos_path(node_id)
     with open(path, "w", encoding="utf-8") as f:
@@ -107,10 +87,6 @@ def save_paxos_state(node_id: int, paxos: PaxosState) -> None:
 
 
 def load_paxos_state(node_id: int, paxos: PaxosState) -> None:
-    """
-    Load Paxos acceptor state from disk into an existing PaxosState object.
-    If file is missing, leave paxos as empty.
-    """
     path = _paxos_path(node_id)
     if not os.path.exists(path):
         print(

@@ -24,16 +24,6 @@ class NodeConfig:
 
 
 class Node:
-    """
-    Node abstraction.
-
-    Owns:
-    - blockchain
-    - network (TCP, JSON messages)
-    - message queue (for PROMISE/ACCEPTED/etc.)
-    - Paxos state (acceptor, and proposer helper logic here)
-    """
-
     def __init__(self, config: NodeConfig):
         if config.node_id < 1 or config.node_id > config.num_nodes:
             raise ValueError(
@@ -900,19 +890,16 @@ class Node:
             f"Reloading state and starting network."
         )
 
-        # Reload state from disk
         self.blockchain = persistence.load_blockchain(
             self.node_id, self.num_nodes, self.initial_balance
         )
         self.paxos = PaxosState(self.node_id)
         persistence.load_paxos_state(self.node_id, self.paxos)
 
-        # Restart network
         self.running = True
         if self.network:
             self.network.start()
         else:
             self.network = self._init_network()
 
-        # Try to catch up if behind
         self._sync_from_peers()

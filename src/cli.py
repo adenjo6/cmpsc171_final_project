@@ -4,7 +4,6 @@ from node import Node
 
 
 def run_cli(node: Node):
-    """Simple blocking CLI loop for a single node."""
     print(
         f"[CLI] Node {node.node_id} ready. Commands:\n"
         "  moneyTransfer <debit_id> <credit_id> <amount>\n"
